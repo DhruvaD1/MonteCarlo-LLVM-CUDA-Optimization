@@ -1,0 +1,516 @@
+#include "llvm/Pass.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/GlobalValue.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/LoopUtils.h"
+#include <vector>
+#include <map>
+
+using namespace llvm;
+
+static cl::opt<unsigned> TileSize("tile-size", cl::desc("Tile size for matrix multiplication"), cl::value_desc("size"), cl::init(32));
+
+namespace {
+    struct AutoTilingPass : public FunctionPass {
+        static char ID;
+        AutoTilingPass() : FunctionPass(ID) {}
+
+        bool runOnFunction(Function &F) override {
+            // Check if this is a CUDA kernel function
+            if (!isCUDAKernel(F)) {
+                return false;
+            }
+
+            errs() << "Processing CUDA kernel: " << F.getName() << "\n";
+
+            // Get required analysis passes
+            LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
+            
+            // Find the target loop structure for Monte Carlo simulation
+            Loop *targetLoop = findMonteCarloLoop(F, LI);
+            if (!targetLoop) {
+                errs() << "Could not find suitable Monte Carlo loop structure\n";
+                return false;
+            }
+
+            errs() << "Found target Monte Carlo loop for tiling optimization\n";
+
+            // Perform the tiling transformation
+            bool transformed = performTilingTransformation(F, targetLoop);
+            
+            if (transformed) {
+                errs() << "Successfully applied tiling transformation\n";
+            } else {
+                errs() << "Failed to apply tiling transformation\n";
+            }
+
+            return transformed;
+        }
+
+        void getAnalysisUsage(AnalysisUsage &AU) const override {
+            AU.addRequired<LoopInfoWrapperPass>();
+            AU.addPreserved<LoopInfoWrapperPass>();
+        }
+
+    private:
+        bool isCUDAKernel(Function &F) {
+            // Check for NVVM kernel metadata or calling convention
+            if (F.getCallingConv() == CallingConv::PTX_Kernel) {
+                return true;
+            }
+
+            // Check for nvvm.kernel metadata
+            Module *M = F.getParent();
+            if (NamedMDNode *KernelMD = M->getNamedMetadata("nvvm.annotations")) {
+                for (unsigned i = 0, e = KernelMD->getNumOperands(); i != e; ++i) {
+                    MDNode *MD = KernelMD->getOperand(i);
+                    if (MD->getNumOperands() >= 2) {
+                        if (auto *V = dyn_cast<ValueAsMetadata>(MD->getOperand(0))) {
+                            if (V->getValue() == &F) {
+                                if (auto *CMeta = dyn_cast<ConstantAsMetadata>(MD->getOperand(1))) {
+                                    if (auto *CI = dyn_cast<ConstantInt>(CMeta->getValue())) {
+                                        if (CI->getZExtValue() == 1) { // kernel annotation
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Fallback: check function name contains "kernel" or starts with device functions
+            StringRef name = F.getName();
+            return name.contains("kernel") || name.contains("Kernel") || name.startswith("_Z");
+        }
+
+        Loop* findMonteCarloLoop(Function &F, LoopInfo &LI) {
+            // Look for Monte Carlo simulation loops that contain:
+            // 1. Multiple nested loops (time steps, assets)
+            // 2. Frequent global memory accesses to market data
+            // 3. Complex mathematical operations (exp, sqrt, etc.)
+            
+            for (Loop *L : LI) {
+                if (isMonteCarloPattern(L)) {
+                    return L;
+                }
+                // Also check nested loops
+                for (Loop *SubL : L->getSubLoops()) {
+                    if (isMonteCarloPattern(SubL)) {
+                        return SubL;
+                    }
+                }
+            }
+            return nullptr;
+        }
+
+        bool isMonteCarloPattern(Loop *L) {
+            // Check if this loop contains the typical Monte Carlo pattern:
+            // 1. Multiple load instructions from global memory structures
+            // 2. Complex floating-point operations (exp, sqrt, pow, etc.)
+            // 3. Random number generation calls
+            // 4. Nested loops for time evolution
+            
+            bool hasComplexStructLoads = false;
+            bool hasComplexMath = false;
+            bool hasRandomNumberGen = false;
+            int globalLoadCount = 0;
+            
+            for (BasicBlock *BB : L->blocks()) {
+                for (Instruction &I : *BB) {
+                    if (LoadInst *LI = dyn_cast<LoadInst>(&I)) {
+                        // Check if loading from global memory structures
+                        Type *PtrTy = LI->getPointerOperand()->getType();
+                        if (PointerType *PT = dyn_cast<PointerType>(PtrTy)) {
+                            if (PT->getAddressSpace() == 1) { // Global memory
+                                globalLoadCount++;
+                                
+                                // Check if loading from struct members (GEP instructions)
+                                if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(LI->getPointerOperand())) {
+                                    hasComplexStructLoads = true;
+                                }
+                            }
+                        }
+                    }
+                    
+                    if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+                        Function *CalledFunc = CI->getCalledFunction();
+                        if (CalledFunc) {
+                            StringRef FuncName = CalledFunc->getName();
+                            // Check for mathematical functions
+                            if (FuncName.contains("exp") || FuncName.contains("sqrt") || 
+                                FuncName.contains("pow") || FuncName.contains("log")) {
+                                hasComplexMath = true;
+                            }
+                            // Check for random number generation
+                            if (FuncName.contains("curand") || FuncName.contains("rand")) {
+                                hasRandomNumberGen = true;
+                            }
+                        }
+                    }
+                    
+                    // Check for complex arithmetic that's typical in Monte Carlo
+                    if (isa<FMulInst>(&I) || isa<FAddInst>(&I) || isa<FSubInst>(&I) || isa<FDivInst>(&I)) {
+                        hasComplexMath = true;
+                    }
+                }
+            }
+            
+            // Monte Carlo pattern: frequent global memory access + complex math
+            return (globalLoadCount > 5) && hasComplexMath && hasComplexStructLoads;
+        }
+
+        bool performTilingTransformation(Function &F, Loop *targetLoop) {
+            LLVMContext &Ctx = F.getContext();
+            IRBuilder<> Builder(Ctx);
+            
+            // Get the entry block to insert shared memory allocations
+            BasicBlock *EntryBB = &F.getEntryBlock();
+            Builder.SetInsertPoint(&EntryBB->front());
+            
+            // Create shared memory structures for Monte Carlo data
+            // In NVPTX LLVM IR, shared memory is address space 3
+            Type *FloatTy = Type::getFloatTy(Ctx);
+            Type *Int32Ty = Type::getInt32Ty(Ctx);
+            
+            // Create shared memory arrays for frequently accessed market data
+            Type *CorrelationMatrixTy = ArrayType::get(FloatTy, 16 * 16); // NUM_ASSETS * NUM_ASSETS
+            Type *AssetDataTy = ArrayType::get(FloatTy, 16); // NUM_ASSETS
+            
+            // Allocate shared memory for market data caching
+            AllocaInst *SharedCorrelationMatrix = Builder.CreateAlloca(CorrelationMatrixTy, nullptr, "shared_correlation");
+            AllocaInst *SharedVolatilities = Builder.CreateAlloca(AssetDataTy, nullptr, "shared_volatilities");
+            AllocaInst *SharedSpotPrices = Builder.CreateAlloca(AssetDataTy, nullptr, "shared_spot_prices");
+            AllocaInst *SharedWeights = Builder.CreateAlloca(AssetDataTy, nullptr, "shared_weights");
+            
+            // Set alignment for shared memory
+            SharedCorrelationMatrix->setAlignment(Align(4));
+            SharedVolatilities->setAlignment(Align(4));
+            SharedSpotPrices->setAlignment(Align(4));
+            SharedWeights->setAlignment(Align(4));
+            
+            errs() << "Created shared memory allocations for Monte Carlo data\n";
+            
+            // Find the original loop structure and extract key components
+            BasicBlock *LoopHeader = targetLoop->getHeader();
+            BasicBlock *LoopLatch = targetLoop->getLoopLatch();
+            BasicBlock *ExitBB = targetLoop->getExitBlock();
+            
+            if (!LoopHeader || !LoopLatch || !ExitBB) {
+                errs() << "Invalid loop structure for transformation\n";
+                return false;
+            }
+            
+            // Create new basic blocks for tiled execution
+            BasicBlock *TileLoopHeader = BasicBlock::Create(Ctx, "tile_loop_header", &F);
+            BasicBlock *TileLoadBB = BasicBlock::Create(Ctx, "tile_load", &F);
+            BasicBlock *TileComputeBB = BasicBlock::Create(Ctx, "tile_compute", &F);
+            BasicBlock *TileLoopLatch = BasicBlock::Create(Ctx, "tile_loop_latch", &F);
+            
+            // Modify the original loop entry to jump to our tiled version
+            TerminatorInst *OrigTerminator = LoopHeader->getTerminator();
+            Builder.SetInsertPoint(OrigTerminator);
+            
+            // Create the outer tiling loop (iterates over tiles)
+            Builder.SetInsertPoint(TileLoopHeader);
+            PHINode *TileIdx = Builder.CreatePHI(Type::getInt32Ty(Ctx), 2, "tile_k");
+            
+            // Add market data caching logic
+            Builder.SetInsertPoint(TileLoadBB);
+            insertMarketDataCaching(Builder, F, SharedCorrelationMatrix, SharedVolatilities, 
+                                   SharedSpotPrices, SharedWeights);
+            
+            // Insert synchronization barrier after loading market data
+            insertSynchronizationBarrier(Builder, F);
+            
+            // Add optimized Monte Carlo computation logic
+            Builder.SetInsertPoint(TileComputeBB);
+            insertOptimizedMonteCarloCode(Builder, targetLoop, SharedCorrelationMatrix, 
+                                        SharedVolatilities, SharedSpotPrices, SharedWeights);
+            
+            // Update PHI node and create loop structure
+            Builder.SetInsertPoint(TileLoopLatch);
+            Value *NextTileIdx = Builder.CreateAdd(TileIdx, Builder.getInt32(TileSize), "next_tile");
+            Value *MatrixWidth = extractMatrixWidth(F);
+            Value *TileCond = Builder.CreateICmpSLT(NextTileIdx, MatrixWidth, "tile_cond");
+            Builder.CreateCondBr(TileCond, TileLoopHeader, ExitBB);
+            
+            // Update PHI node incoming values
+            TileIdx->addIncoming(Builder.getInt32(0), LoopHeader);
+            TileIdx->addIncoming(NextTileIdx, TileLoopLatch);
+            
+            // Connect the basic blocks
+            Builder.SetInsertPoint(TileLoopHeader);
+            Builder.CreateBr(TileLoadBB);
+            
+            Builder.SetInsertPoint(TileLoadBB);
+            Builder.CreateBr(TileComputeBB);
+            
+            Builder.SetInsertPoint(TileComputeBB);
+            Builder.CreateBr(TileLoopLatch);
+            
+            // Redirect original loop entry to our tiled version
+            OrigTerminator->replaceSuccessorWith(LoopHeader, TileLoopHeader);
+            
+            errs() << "Completed tiling transformation structure\n";
+            return true;
+        }
+
+        void insertMarketDataCaching(IRBuilder<> &Builder, Function &F, 
+                                   AllocaInst *SharedCorrelationMatrix,
+                                   AllocaInst *SharedVolatilities,
+                                   AllocaInst *SharedSpotPrices,
+                                   AllocaInst *SharedWeights) {
+            // Extract thread indices
+            Value *ThreadIdxX = getThreadIndex(Builder, F, 0); // threadIdx.x
+            Value *ThreadIdxY = getThreadIndex(Builder, F, 1); // threadIdx.y
+            Value *BlockDimX = getBlockDim(Builder, F, 0);     // blockDim.x
+            
+            // Calculate thread ID within block
+            Value *LocalThreadId = Builder.CreateAdd(
+                Builder.CreateMul(ThreadIdxY, BlockDimX), ThreadIdxX, "local_tid"
+            );
+            
+            // Get market data parameter (assuming it's a function argument)
+            Value *MarketData = getMarketDataArgument(F); 
+            
+            // Cooperatively load market data into shared memory
+            // Each thread loads multiple elements to fully populate shared memory
+            
+            // Load correlation matrix elements
+            Value *MatrixSize = Builder.getInt32(16 * 16); // NUM_ASSETS * NUM_ASSETS
+            Value *LoadCorrelationCond = Builder.CreateICmpSLT(LocalThreadId, MatrixSize);
+            
+            BasicBlock *LoadCorrelationBB = BasicBlock::Create(Builder.getContext(), "load_correlation", &F);
+            BasicBlock *SkipCorrelationBB = BasicBlock::Create(Builder.getContext(), "skip_correlation", &F);
+            Builder.CreateCondBr(LoadCorrelationCond, LoadCorrelationBB, SkipCorrelationBB);
+            
+            // Load correlation matrix
+            Builder.SetInsertPoint(LoadCorrelationBB);
+            Value *CorrelationPtr = Builder.CreateGEP(
+                MarketData->getType()->getPointerElementType(), MarketData,
+                {Builder.getInt32(0), Builder.getInt32(0), LocalThreadId} // correlation_matrix[tid]
+            );
+            Value *CorrelationValue = Builder.CreateLoad(Type::getFloatTy(Builder.getContext()), CorrelationPtr);
+            
+            Value *SharedCorrelationPtr = Builder.CreateGEP(
+                SharedCorrelationMatrix->getAllocatedType(), SharedCorrelationMatrix,
+                {Builder.getInt32(0), LocalThreadId}
+            );
+            Builder.CreateStore(CorrelationValue, SharedCorrelationPtr);
+            Builder.CreateBr(SkipCorrelationBB);
+            
+            // Continue with volatilities, spot prices, and weights
+            Builder.SetInsertPoint(SkipCorrelationBB);
+            
+            // Load volatilities (16 elements)
+            Value *AssetCount = Builder.getInt32(16); // NUM_ASSETS
+            Value *LoadVolatilityCond = Builder.CreateICmpSLT(LocalThreadId, AssetCount);
+            
+            BasicBlock *LoadVolatilityBB = BasicBlock::Create(Builder.getContext(), "load_volatility", &F);
+            BasicBlock *ContinueBB = BasicBlock::Create(Builder.getContext(), "continue_load", &F);
+            Builder.CreateCondBr(LoadVolatilityCond, LoadVolatilityBB, ContinueBB);
+            
+            Builder.SetInsertPoint(LoadVolatilityBB);
+            
+            // Load volatilities[tid], spot_prices[tid], weights[tid]
+            Value *VolatilityPtr = Builder.CreateGEP(
+                MarketData->getType()->getPointerElementType(), MarketData,
+                {Builder.getInt32(0), Builder.getInt32(1), LocalThreadId}
+            );
+            Value *SpotPricePtr = Builder.CreateGEP(
+                MarketData->getType()->getPointerElementType(), MarketData,
+                {Builder.getInt32(0), Builder.getInt32(2), LocalThreadId}
+            );
+            Value *WeightPtr = Builder.CreateGEP(
+                MarketData->getType()->getPointerElementType(), MarketData,
+                {Builder.getInt32(0), Builder.getInt32(3), LocalThreadId}
+            );
+            
+            Value *VolatilityValue = Builder.CreateLoad(Type::getFloatTy(Builder.getContext()), VolatilityPtr);
+            Value *SpotPriceValue = Builder.CreateLoad(Type::getFloatTy(Builder.getContext()), SpotPricePtr);
+            Value *WeightValue = Builder.CreateLoad(Type::getFloatTy(Builder.getContext()), WeightPtr);
+            
+            // Store to shared memory
+            Value *SharedVolatilityPtr = Builder.CreateGEP(
+                SharedVolatilities->getAllocatedType(), SharedVolatilities,
+                {Builder.getInt32(0), LocalThreadId}
+            );
+            Value *SharedSpotPricePtr = Builder.CreateGEP(
+                SharedSpotPrices->getAllocatedType(), SharedSpotPrices,
+                {Builder.getInt32(0), LocalThreadId}
+            );
+            Value *SharedWeightPtr = Builder.CreateGEP(
+                SharedWeights->getAllocatedType(), SharedWeights,
+                {Builder.getInt32(0), LocalThreadId}
+            );
+            
+            Builder.CreateStore(VolatilityValue, SharedVolatilityPtr);
+            Builder.CreateStore(SpotPriceValue, SharedSpotPricePtr);
+            Builder.CreateStore(WeightValue, SharedWeightPtr);
+            
+            Builder.CreateBr(ContinueBB);
+            Builder.SetInsertPoint(ContinueBB);
+        }
+
+        void insertSynchronizationBarrier(IRBuilder<> &Builder, Function &F) {
+            // Insert call to __syncthreads() equivalent
+            // In LLVM IR for NVPTX, this is the llvm.nvvm.barrier0 intrinsic
+            Module *M = F.getParent();
+            Function *BarrierFunc = Intrinsic::getDeclaration(M, Intrinsic::nvvm_barrier0);
+            Builder.CreateCall(BarrierFunc);
+        }
+
+        void insertOptimizedMonteCarloCode(IRBuilder<> &Builder, Loop *OriginalLoop,
+                                         AllocaInst *SharedCorrelationMatrix,
+                                         AllocaInst *SharedVolatilities,
+                                         AllocaInst *SharedSpotPrices,
+                                         AllocaInst *SharedWeights) {
+            // Replace global memory accesses with shared memory accesses
+            // This is a simplified transformation - in practice, we'd need to:
+            // 1. Identify all global memory loads in the original loop
+            // 2. Replace them with shared memory loads
+            // 3. Handle the complex control flow
+            
+            LLVMContext &Ctx = Builder.getContext();
+            Function &F = *Builder.GetInsertBlock()->getParent();
+            
+            // Create basic blocks for optimized computation
+            BasicBlock *OptimizedComputeBB = BasicBlock::Create(Ctx, "optimized_compute", &F);
+            Builder.CreateBr(OptimizedComputeBB);
+            Builder.SetInsertPoint(OptimizedComputeBB);
+            
+            Value *ThreadIdxX = getThreadIndex(Builder, F, 0);
+            Value *ThreadIdxY = getThreadIndex(Builder, F, 1);
+            
+            // Example: Load volatility from shared memory instead of global memory
+            Value *AssetIndex = Builder.CreateURem(ThreadIdxX, Builder.getInt32(16), "asset_idx");
+            
+            Value *SharedVolatilityPtr = Builder.CreateGEP(
+                SharedVolatilities->getAllocatedType(), SharedVolatilities,
+                {Builder.getInt32(0), AssetIndex}
+            );
+            Value *VolatilityFromShared = Builder.CreateLoad(Type::getFloatTy(Ctx), SharedVolatilityPtr);
+            
+            // Example: Load correlation matrix element from shared memory
+            Value *CorrelationIndex = Builder.CreateAdd(
+                Builder.CreateMul(ThreadIdxY, Builder.getInt32(16)), ThreadIdxX, "corr_idx"
+            );
+            Value *BoundedCorrIndex = Builder.CreateURem(CorrelationIndex, Builder.getInt32(16 * 16));
+            
+            Value *SharedCorrelationPtr = Builder.CreateGEP(
+                SharedCorrelationMatrix->getAllocatedType(), SharedCorrelationMatrix,
+                {Builder.getInt32(0), BoundedCorrIndex}
+            );
+            Value *CorrelationFromShared = Builder.CreateLoad(Type::getFloatTy(Ctx), SharedCorrelationPtr);
+            
+            // Insert a placeholder computation using shared memory values
+            Value *OptimizedResult = Builder.CreateFMul(VolatilityFromShared, CorrelationFromShared, "optimized_result");
+            
+            // In a real implementation, we would:
+            // 1. Clone the original loop body
+            // 2. Replace all global memory accesses with shared memory equivalents
+            // 3. Maintain the same computational logic but with better memory locality
+            
+            errs() << "Inserted optimized Monte Carlo computation using shared memory\n";
+        }
+
+        Value* getThreadIndex(IRBuilder<> &Builder, Function &F, int dim) {
+            // Get CUDA thread index for dimension (0=x, 1=y, 2=z)
+            Module *M = F.getParent();
+            Function *TidFunc;
+            
+            switch (dim) {
+                case 0: TidFunc = Intrinsic::getDeclaration(M, Intrinsic::nvvm_read_ptx_sreg_tid_x); break;
+                case 1: TidFunc = Intrinsic::getDeclaration(M, Intrinsic::nvvm_read_ptx_sreg_tid_y); break;
+                case 2: TidFunc = Intrinsic::getDeclaration(M, Intrinsic::nvvm_read_ptx_sreg_tid_z); break;
+                default: return Builder.getInt32(0);
+            }
+            
+            return Builder.CreateCall(TidFunc);
+        }
+
+        Value* getBlockIndex(IRBuilder<> &Builder, Function &F, int dim) {
+            Module *M = F.getParent();
+            Function *CtaidFunc;
+            
+            switch (dim) {
+                case 0: CtaidFunc = Intrinsic::getDeclaration(M, Intrinsic::nvvm_read_ptx_sreg_ctaid_x); break;
+                case 1: CtaidFunc = Intrinsic::getDeclaration(M, Intrinsic::nvvm_read_ptx_sreg_ctaid_y); break;
+                case 2: CtaidFunc = Intrinsic::getDeclaration(M, Intrinsic::nvvm_read_ptx_sreg_ctaid_z); break;
+                default: return Builder.getInt32(0);
+            }
+            
+            return Builder.CreateCall(CtaidFunc);
+        }
+
+        Value* getBlockDim(IRBuilder<> &Builder, Function &F, int dim) {
+            Module *M = F.getParent();
+            Function *NtidFunc;
+            
+            switch (dim) {
+                case 0: NtidFunc = Intrinsic::getDeclaration(M, Intrinsic::nvvm_read_ptx_sreg_ntid_x); break;
+                case 1: NtidFunc = Intrinsic::getDeclaration(M, Intrinsic::nvvm_read_ptx_sreg_ntid_y); break;
+                case 2: NtidFunc = Intrinsic::getDeclaration(M, Intrinsic::nvvm_read_ptx_sreg_ntid_z); break;
+                default: return Builder.getInt32(1);
+            }
+            
+            return Builder.CreateCall(NtidFunc);
+        }
+
+        Value* getMarketDataArgument(Function &F) {
+            // Market data is typically the 4th argument (index 3) in Monte Carlo kernels
+            auto it = F.arg_begin();
+            std::advance(it, 3);
+            return &*it;
+        }
+
+        Value* getNumSimulations(Function &F) {
+            // Number of simulations is typically the 6th argument (index 5)
+            auto it = F.arg_begin();
+            std::advance(it, 5);
+            return &*it;
+        }
+
+        Value* extractMatrixWidth(Function &F) {
+            // For Monte Carlo, we use number of simulations instead of matrix width
+            return getNumSimulations(F);
+        }
+    };
+}
+
+char AutoTilingPass::ID = 0;
+
+// Register the pass
+static RegisterPass<AutoTilingPass> X("autotile", "Automatic Tiling Pass for GPU Kernels", false, false);
+
+// Plugin interface for dynamically loaded passes
+extern "C" LLVM_ATTRIBUTE_WEAK void llvmGetPassPluginInfo(PassPluginAPI &API) {
+    API.getPassPluginInfo = []() {
+        return PassPluginInfo{
+            LLVM_PLUGIN_API_VERSION, "AutoTilingPass", "v0.1",
+            [](PassBuilder &PB) {
+                PB.registerPipelineParsingCallback(
+                    [](StringRef Name, FunctionPassManager &FPM,
+                       ArrayRef<PassBuilder::PipelineElement>) {
+                        if (Name == "autotile") {
+                            FPM.addPass(AutoTilingPass());
+                            return true;
+                        }
+                        return false;
+                    });
+            }};
+    };
+}

@@ -1,0 +1,45 @@
+# Build outputs
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# LLVM IR files
+*.ll
+*.bc
+
+# CUDA compilation temps
+*.cubin
+*.fatbin
+*.ptx
+
+# Executables
+monte_carlo_*
+matrix_mul_*
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Log files
+*.log
+
+# Personal PDFs (keep the project ones)
+Untitled*.pdf
+
+# Ignore all markdown files except README.md
+*.md
+!README.md
