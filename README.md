@@ -4,7 +4,6 @@
 
 ![CUDA](https://img.shields.io/badge/CUDA-12.6-green.svg)
 ![LLVM](https://img.shields.io/badge/LLVM-18.1.3-blue.svg)
-![GPU](https://img.shields.io/badge/GPU-RTX%205070%20Ti-brightgreen.svg)
 ![Performance](https://img.shields.io/badge/Performance-53%2C546%20GFLOPS-red.svg)
 
 ## Overview
