@@ -8,7 +8,7 @@
 
 ## Overview
 
-This project demonstrates GPU compiler optimization by implementing a Monte Carlo Asian option pricing simulation that leverages both CUDA for GPU acceleration and LLVM for host code optimization. The system achieves increased performance on NVIDIA RTX Cards.
+This is a GPU compiler optimization for the Monte Carlo Asian option pricing that leverages both CUDA for GPU acceleration and LLVM for host code optimization. The system achieves increased performance on NVIDIA RTX Cards.
 
 ## Key Features
 
@@ -31,9 +31,9 @@ This project demonstrates GPU compiler optimization by implementing a Monte Carl
 ```
 CUDA Source Code (.cu)
        ↓
-LLVM IR Generation (191KB)
+LLVM IR Generation
        ↓
-LLVM -O3 Optimizations (194KB)
+LLVM -O3 Optimizations
        ↓
 Advanced AutoTiling Pass
        ↓
@@ -149,7 +149,7 @@ ocaml benchmark.ml
 
 ## System Requirements
 
-- **GPU**: NVIDIA RTX series
+- **GPU**: Any NVIDIA RTX Card
 - **CUDA**: 12.6 or later
 - **LLVM**: 18.1.3 or later
 - **Memory**: 8GB+ GPU memory for large simulations
