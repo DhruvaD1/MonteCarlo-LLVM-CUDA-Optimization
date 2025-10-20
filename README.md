@@ -61,12 +61,14 @@ sudo apt install llvm-18 llvm-18-dev llvm-18-tools clang-18
 
 ### Build & Run
 ```bash
+# Clone repository
+git clone https://github.com/DhruvaD1/MonteCarlo-LLVM-CUDA-Optimization
+cd MonteCarlo-LLVM-CUDA-Optimization
 
-cd cuda-monte-carlo-llvm
+# Build with OCaml functional programming system
+ocaml build.ml
 
-chmod +x scripts/build.sh
-./scripts/build.sh
-
+# Run Monte Carlo simulation
 ./build/monte_carlo_baseline 16384 256
 ```
 
@@ -78,9 +80,8 @@ chmod +x scripts/build.sh
 │   └── AutoTilingPass/         # LLVM optimization pass
 │       ├── AutoTilingPass.cpp  # GPU kernel tiling transformations
 │       └── CMakeLists.txt      # LLVM pass build configuration
-├── scripts/
-│   ├── build.sh               # Automated build system
-│   └── benchmark.sh           # Performance benchmarking
+├── build.ml                    # OCaml functional programming build system
+├── benchmark.ml                # OCaml performance analysis system
 ├── docs/
 │   └── setup.md              # Detailed setup instructions
 ├── results/
@@ -139,11 +140,12 @@ clang++ -O3 matrix_mul_optimized.ll -lcudart -lcurand -o monte_carlo_optimized
 ## Benchmarking
 
 ```bash
+# Run comprehensive OCaml benchmark analysis
+ocaml benchmark.ml
 
-./scripts/benchmark.sh
-
-./build/monte_carlo_baseline 32768 512
-./monte_carlo_llvm_optimized 32768 512
+# Manual performance comparison
+./build/monte_carlo_baseline 32768 512        # Baseline (nvcc compiled)
+./monte_carlo_llvm_optimized 32768 512        # LLVM optimized version
 ```
 
 ## System Requirements
