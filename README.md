@@ -161,7 +161,3 @@ clang++ -O3 matrix_mul_optimized.ll -lcudart -lcurand -o monte_carlo_optimized
 - **Complete LLVM integration** with custom optimization passes
 - **Advanced compiler technology** demonstration
 - **Production-ready architecture** with automated build system
-
-## License
-
-MIT License - see [LICENSE](LICENSE) file for details.
