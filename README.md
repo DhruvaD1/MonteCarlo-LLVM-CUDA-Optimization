@@ -64,7 +64,7 @@ sudo apt install llvm-18 llvm-18-dev llvm-18-tools clang-18
 git clone https://github.com/DhruvaD1/MonteCarlo-LLVM-CUDA-Optimization
 cd MonteCarlo-LLVM-CUDA-Optimization
 
-# Build with OCaml functional programming system
+# Build with OCaml
 ocaml build.ml
 
 # Run Monte Carlo simulation
