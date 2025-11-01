@@ -139,7 +139,7 @@ clang++ -O3 matrix_mul_optimized.ll -lcudart -lcurand -o monte_carlo_optimized
 ## Benchmarking
 
 ```bash
-# Run comprehensive OCaml benchmark analysis
+# Run benchmark
 ocaml benchmark.ml
 
 # Manual performance comparison
